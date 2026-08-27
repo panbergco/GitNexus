@@ -6,6 +6,8 @@ const ENV_KEYS = [
   'GITNEXUS_EMBEDDING_MODEL',
   'GITNEXUS_EMBEDDING_API_KEY',
   'GITNEXUS_EMBEDDING_DIMS',
+  'GITNEXUS_EMBEDDING_TIMEOUT_MS',
+  'GITNEXUS_EMBEDDING_TIMEOUT_RETRIES',
 ] as const;
 
 /** 384d mock vector matching the default schema dimensions. */
@@ -17,6 +19,7 @@ describe('HTTP embedding backend', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     vi.resetModules();
     // Restore env vars to pre-test state so a mid-test throw can't leak
     for (const key of ENV_KEYS) {
@@ -399,6 +402,29 @@ describe('HTTP embedding backend', () => {
       const { embedText } = await import('../../src/core/embeddings/embedder.js');
       await expect(embedText('test')).rejects.toThrow('timed out');
       expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries a timeout when explicitly configured', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_TIMEOUT_RETRIES = '1';
+
+      const timeoutErr = new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError',
+      );
+      const ok = { ok: true, json: async () => ({ data: [{ embedding: mockVec }] }) };
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(timeoutErr).mockResolvedValueOnce(ok));
+      vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void) => {
+        fn();
+        return 0;
+      }) as typeof setTimeout);
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      const result = await embedText('test');
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(result).toBeInstanceOf(Float32Array);
     });
 
     it('retries on network error then succeeds', async () => {

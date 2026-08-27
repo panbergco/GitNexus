@@ -191,6 +191,19 @@ program
   .action(createLbugLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
+  .command('embeddings [path]')
+  .description(t('help.command.embeddings.description'))
+  .addHelpText(
+    'after',
+    '\nEnvironment variables:\n' +
+      '  GITNEXUS_EMBEDDING_URL, GITNEXUS_EMBEDDING_MODEL, GITNEXUS_EMBEDDING_API_KEY\n' +
+      '  GITNEXUS_EMBEDDING_DIMS, GITNEXUS_EMBEDDING_BATCH_SIZE, GITNEXUS_EMBEDDING_SUB_BATCH_SIZE\n' +
+      '  GITNEXUS_EMBEDDING_TIMEOUT_MS (default 30000)\n' +
+      '  GITNEXUS_EMBEDDING_TIMEOUT_RETRIES (default 0)\n',
+  )
+  .action(createLbugLazyAction(() => import('./embeddings.js'), 'embeddingsCommand'));
+
+program
   .command('index [path...]')
   .description(
     'Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)',

@@ -13,12 +13,21 @@
 
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
-const HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
 const HTTP_BATCH_SIZE = 64;
 const DEFAULT_DIMS = 384;
 const HTTP_BREAKER_KEY = 'embeddings-http';
+
+const readIntegerEnv = (name: string, fallback: number, minimum: number): number => {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw) || Number(raw) < minimum) {
+    throw new Error(`${name} must be an integer >= ${minimum}, got "${raw}"`);
+  }
+  return Number(raw);
+};
 
 interface HttpConfig {
   baseUrl: string;
@@ -120,43 +129,65 @@ const httpEmbedBatch = async (
     requestBody.dimensions = dimensions;
   }
 
-  let resp: Response;
-  try {
-    resp = await resilientFetch(
-      url,
-      {
-        method: 'POST',
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+  const timeoutMs = readIntegerEnv(
+    'GITNEXUS_EMBEDDING_TIMEOUT_MS',
+    DEFAULT_HTTP_TIMEOUT_MS,
+    1,
+  );
+  const timeoutRetries = readIntegerEnv('GITNEXUS_EMBEDDING_TIMEOUT_RETRIES', 0, 0);
+  let resp: Response | undefined;
+  let timedOut = false;
+
+  for (let attempt = 0; attempt <= timeoutRetries; attempt++) {
+    try {
+      resp = await resilientFetch(
+        url,
+        {
+          method: 'POST',
+          signal: AbortSignal.timeout(timeoutMs),
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(requestBody),
         },
-        body: JSON.stringify(requestBody),
-      },
-      {
-        breakerKey: HTTP_BREAKER_KEY,
-        retry: { maxAttempts: HTTP_MAX_RETRIES + 1, baseDelayMs: HTTP_RETRY_BACKOFF_MS },
-      },
-    );
-  } catch (err) {
-    if (err instanceof CircuitOpenError) {
-      throw new Error(
-        `Embedding endpoint circuit open (${safeUrl(url)}, batch ${batchIndex}): retry in ${Math.ceil(err.retryAfterMs / 1000)}s`,
+        {
+          breakerKey: HTTP_BREAKER_KEY,
+          retry: { maxAttempts: HTTP_MAX_RETRIES + 1, baseDelayMs: HTTP_RETRY_BACKOFF_MS },
+        },
       );
+      break;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'TimeoutError') {
+        timedOut = true;
+        if (attempt < timeoutRetries) {
+          await new Promise((resolve) => setTimeout(resolve, HTTP_RETRY_BACKOFF_MS));
+          continue;
+        }
+      } else if (err instanceof CircuitOpenError) {
+        throw new Error(
+          `Embedding endpoint circuit open (${safeUrl(url)}, batch ${batchIndex}): retry in ${Math.ceil(err.retryAfterMs / 1000)}s`,
+        );
+      } else if (err instanceof ResilientFetchExhaustedError) {
+        throw new Error(
+          `Embedding endpoint returned ${err.response.status} (${safeUrl(url)}, batch ${batchIndex})`,
+        );
+      } else {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Embedding request failed (${safeUrl(url)}, batch ${batchIndex}): ${reason}`,
+        );
+      }
     }
-    if (err instanceof DOMException && err.name === 'TimeoutError') {
-      throw new Error(
-        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
-      );
-    }
-    if (err instanceof ResilientFetchExhaustedError) {
-      throw new Error(
-        `Embedding endpoint returned ${err.response.status} (${safeUrl(url)}, batch ${batchIndex})`,
-      );
-    }
-    const reason = err instanceof Error ? err.message : String(err);
-    throw new Error(`Embedding request failed (${safeUrl(url)}, batch ${batchIndex}): ${reason}`);
   }
+
+  if (!resp && timedOut) {
+    throw new Error(
+      `Embedding request timed out after ${timeoutMs}ms ` +
+        `(${safeUrl(url)}, batch ${batchIndex}, ${timeoutRetries + 1} attempt(s))`,
+    );
+  }
+  if (!resp) throw new Error(`Embedding request failed (${safeUrl(url)}, batch ${batchIndex})`);
 
   if (!resp.ok) {
     // resilientFetch already retried 5xx/429; any non-OK response here is
